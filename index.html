@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Arcanum Card Forge</title>
+<meta name="description" content="Arcanum Card Forge — a WebGL-powered card creator with pixel art processing, holographic effects, and audio-reactive shader backgrounds."/>
+<meta property="og:title" content="Arcanum Card Forge"/>
+<meta property="og:description" content="Create custom cards with pixel art, holographic effects, and audio-reactive shaders."/>
+<meta property="og:type" content="website"/>
+<meta name="theme-color" content="#0a0810"/>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✦</text></svg>"/>
+<link rel="stylesheet" href="styles.css"/>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="shaders/bg.glsl.js"></script>
+<script src="shaders/img.glsl.js"></script>
+<script type="text/babel" src="webgl-helpers.jsx"></script>
+<script type="text/babel" src="audio-reactor.jsx"></script>
+<script type="text/babel" src="card-bg.jsx"></script>
+<script type="text/babel" src="card.jsx"></script>
+<script type="text/babel" src="panel.jsx"></script>
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef } = React;
+
+class ErrorBoundary extends React.Component {
+  constructor(props){ super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(e){ return { error: e }; }
+  componentDidCatch(e, info){ console.error('Arcanum Forge error:', e, info); }
+  render(){
+    if(this.state.error) return React.createElement('div', {
+      style: { position:'fixed', inset:0, display:'flex', alignItems:'center', justifyContent:'center',
+               flexDirection:'column', gap:16, background:'#0a0810', color:'#f3ead4',
+               fontFamily:'monospace', textAlign:'center', padding:24 }
+    },
+      React.createElement('div', { style: { fontSize:48 } }, '✦'),
+      React.createElement('h2', { style: { margin:0, fontFamily:'serif' } }, 'Something went wrong'),
+      React.createElement('p', { style: { opacity:0.6, maxWidth:400 } }, this.state.error.message),
+      React.createElement('button', {
+        onClick: () => this.setState({ error: null }),
+        style: { padding:'10px 24px', background:'#b88210', border:'none', borderRadius:4,
+                 color:'#1a1812', fontWeight:600, cursor:'pointer' }
+      }, 'Try Again')
+    );
+    return this.props.children;
+  }
+}
+
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "showCRT": false,
+  "tilt": true,
+  "showDeck": true
+}/*EDITMODE-END*/;
+
+const STARTER_CARD = {
+  id: 1, kind: 'playing', rank: 'A', suit: 'spade',
+  title: 'The Architect', flavor: 'Builds towers from the bones of yesterday.',
+  value: '+8', type: 'ARCANA',
+  bgType: 'paper', bgColor: '#f3ead4', bgColor2: '#3a1454', frameColor: '#2a2418',
+};
+const STARTER_EFFECTS = { foil: false, holo: true, polychrome: false };
+const STARTER_IMG = {
+  pixelSize: 6, levels: 4, dither: 1, hueShift: 0, saturation: 1.1, contrast: 1.1,
+  palette: 4,
+  customPalette: ['#1a0a2a','#5a1a4a','#a82c52','#e85a4a','#f5a040','#ffd870','#fff5d0','#7be0e5'],
+};
+
+function App(){
+  const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
+
+  const [deck, setDeck] = useState([
+    { card: STARTER_CARD, effects: STARTER_EFFECTS, srcImage: null, processedImage: null,
+      imgOpts: { ...STARTER_IMG } }
+  ]);
+  const [activeIdx, setActiveIdx] = useState(0);
+
+  const active = deck[activeIdx];
+  const card = active.card;
+  const effects = active.effects;
+  const srcImage = active.srcImage;
+  const imgOpts = active.imgOpts;
+
+  const updateActive = (patch) => {
+    setDeck(d => d.map((it,i) => i === activeIdx ? { ...it, ...patch } : it));
+  };
+  const setCard = (c) => updateActive({ card: { ...c, id: card.id } });
+  const setEffects = (e) => updateActive({ effects: e });
+  const setSrcImage = (img) => updateActive({ srcImage: img, processedImage: null });
+  const setImgOpts = (o) => updateActive({ imgOpts: o });
+
+  const [bgOpts, setBgOpts] = useState({
+    mode: 0, intensity: 0.8, audioGain: 0.3,
+    colorA: '#3a1454', colorB: '#c8324f', colorC: '#f0d878',
+  });
+
+  // Initial mode: off (no pulsing without music). User can switch to sim/yt/url/mic.
+  const audioRef = useRef({ low:0, mid:0, high:0, level:0 });
+  const [audio, setAudio] = useState({
+    youtubeUrl: '', directUrl: '', mode: 'off', error: '',
+  });
+
+  useEffect(() => {
+    const stop = AudioReactor.startLoop(audioRef);
+    return stop;
+  }, []);
+
+  // Handle audio actions
+  useEffect(() => {
+    if(!audio.action) return;
+    const { action } = audio;
+    (async () => {
+      try {
+        if(action === 'youtube'){
+          const id = parseYouTubeId(audio.youtubeUrl);
+          if(!id) throw new Error('Invalid YouTube URL.');
+          await AudioReactor.useYouTube(id);
+          setAudio(a => ({...a, mode:'youtube', error:''}));
+        } else if(action === 'direct'){
+          if(!audio.directUrl) throw new Error('Enter a direct audio URL.');
+          await AudioReactor.useAudioURL(audio.directUrl);
+          setAudio(a => ({...a, mode:'audio', error:''}));
+        } else if(action === 'mic'){
+          await AudioReactor.useMic();
+          setAudio(a => ({...a, mode:'mic', error:''}));
+        } else if(action === 'sim'){
+          AudioReactor.setSim();
+          setAudio(a => ({...a, mode:'sim', error:''}));
+        } else if(action === 'stop'){
+          AudioReactor.stop();
+          setAudio(a => ({...a, mode:'off', error:''}));
+        }
+      } catch(e){
+        setAudio(a => ({...a, error: e.message || String(e), mode: 'sim'}));
+        AudioReactor.stop();
+      }
+    })();
+    setAudio(a => ({...a, action: null}));
+  }, [audio.actionT]);
+
+  // Reprocess image when src or opts change
+  useEffect(() => {
+    if(!srcImage){
+      if(active.processedImage) updateActive({ processedImage: null });
+      return;
+    }
+    try {
+      const url = processImage(srcImage, { ...imgOpts, targetW: 320, targetH: 440 });
+      updateActive({ processedImage: url });
+    } catch(e){ console.error(e); }
+  }, [srcImage, imgOpts.pixelSize, imgOpts.levels, imgOpts.dither, imgOpts.hueShift,
+      imgOpts.saturation, imgOpts.contrast, imgOpts.palette,
+      JSON.stringify(imgOpts.customPalette), activeIdx]);
+
+  const addCard = () => {
+    const id = Date.now();
+    setDeck(d => {
+      setActiveIdx(d.length);
+      return [...d, {
+        card: { ...STARTER_CARD, id, rank: 'K', suit: 'star', title: 'Untitled', flavor: '', value: '', type: '',
+                bgType: 'paper', bgColor: '#f3ead4', bgColor2: '#3a1454', frameColor: '#2a2418' },
+        effects: {}, srcImage: null, processedImage: null,
+        imgOpts: { ...STARTER_IMG }
+      }];
+    });
+  };
+  const removeCard = (idx) => {
+    if(deck.length <= 1) return;
+    setDeck(d => d.filter((_,i) => i !== idx));
+    setActiveIdx(i => Math.max(0, Math.min(i, deck.length - 2)));
+  };
+
+  // PNG Export — uses html2canvas to capture only the card element.
+  const onExport = async () => {
+    const target = document.querySelector('.card-wrap .card');
+    if(!target) return;
+    try {
+      const canvas = await html2canvas(target, {
+        backgroundColor: null,
+        scale: 3,                  // hi-res
+        useCORS: true,
+        allowTaint: true,
+        logging: false,
+      });
+      canvas.toBlob((blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `arcanum-card-${card.id || Date.now()}.png`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }, 'image/png');
+    } catch(e){
+      console.error('Export failed:', e);
+      alert('Export failed: ' + e.message);
+    }
+  };
+
+  return (
+    <div>
+      <ShaderBackground {...bgOpts} audioRef={audioRef} audioGain={bgOpts.audioGain}/>
+      {tweaks.showCRT && <div className="crt-overlay"/>}
+
+      <div className="brand-strip">
+        <div className="brand-mark">
+          <span className="glyph">✦</span>
+          <span className="name">ARCANUM FORGE</span>
+        </div>
+        <div className="brand-tag">— card sigil engine · webgl shaders —</div>
+      </div>
+
+      <div className="stage-label">
+        CARD {String(activeIdx+1).padStart(2,'0')} / {String(deck.length).padStart(2,'0')}
+      </div>
+
+      <div className="app-layout">
+        <div className="stage">
+          <ArcanumCard data={card} processedImage={active.processedImage}
+                       effects={effects} tilt={tweaks.tilt}/>
+
+          {tweaks.showDeck && (
+            <div className="stage-deck">
+              {deck.map((d, i) => {
+                const s = SUITS[d.card.suit] || null;
+                return (
+                  <div key={d.card.id} className="deck-item" data-active={i===activeIdx?'1':'0'}
+                       onClick={() => setActiveIdx(i)}
+                       style={{ color: s ? s.color : '#1a1812', background: d.card.bgColor || '#f3ead4' }}>
+                    {d.processedImage
+                      ? <img src={d.processedImage} style={{width:'100%',height:'100%',objectFit:'cover',imageRendering:'pixelated'}}/>
+                      : d.card.suitImage
+                        ? <img src={d.card.suitImage} style={{width:'80%',height:'80%',objectFit:'contain'}}/>
+                        : (d.card.kind==='tarot' ? d.card.roman : (d.card.rank || (s && s.glyph) || '·'))}
+                    {deck.length > 1 && (
+                      <span className="deck-rm" onClick={(e) => { e.stopPropagation(); removeCard(i); }}>×</span>
+                    )}
+                  </div>
+                );
+              })}
+              <div className="deck-item" data-add="1" onClick={addCard}>+</div>
+            </div>
+          )}
+        </div>
+
+        <CardPanel
+          card={card} setCard={setCard}
+          effects={effects} setEffects={setEffects}
+          processedImage={active.processedImage}
+          srcImage={srcImage} setSrcImage={setSrcImage}
+          imgOpts={imgOpts} setImgOpts={setImgOpts}
+          bgOpts={bgOpts} setBgOpts={setBgOpts}
+          audio={audio} setAudio={setAudio}
+          onExport={onExport}/>
+      </div>
+
+      <TweaksPanel title="Forge Tweaks">
+        <TweakSection label="Stage"/>
+        <TweakToggle label="CRT overlay" value={tweaks.showCRT}
+                     onChange={(v) => setTweak('showCRT', v)}/>
+        <TweakToggle label="Card tilt" value={tweaks.tilt}
+                     onChange={(v) => setTweak('tilt', v)}/>
+        <TweakToggle label="Show deck rail" value={tweaks.showDeck}
+                     onChange={(v) => setTweak('showDeck', v)}/>
+      </TweaksPanel>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App/></ErrorBoundary>);
+</script>
+</body>
+</html>
